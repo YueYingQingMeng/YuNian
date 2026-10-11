@@ -32,6 +32,7 @@ pub(crate) mod retry;
 pub mod segmenter;
 pub mod skill_selector;
 pub mod sticker_preference;
+pub(crate) mod temperature;
 
 pub use agent::*;
 pub use api_probe::*;

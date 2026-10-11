@@ -494,8 +494,19 @@ impl NativeGateway {
             "messages": effective_msgs,
             "stream": stream,
         });
-        let safe_temp = cfg.temperature.clamp(0.1, 1.5);
-        body["temperature"] = json!(safe_temp);
+        // temperature：2 位小数归一 + 固定温度模型跳过
+        //
+        // 1) 归一：Room 把 Kotlin Float 写成 SQLite REAL 时按 Float→Double 加宽
+        //    （0.7f → 0.699999988079071），智谱清言等「限制小数点 2 位」的网关会直接 400
+        //    拒绝整个请求（用户实测报障）。详见 temperature.rs。
+        // 2) 固定温度模型（kimi-k2.6 / k2.6）：服务端不接受自定义 temperature，传入即报错。
+        //    此前**只有连接测试**做了该判定（api_probe::api_requires_fixed_temperature），
+        //    生成路径漏判 → 测试通过但每次聊天必失败。语义与 Kotlin
+        //    AiService.requiresFixedTemperature 完全一致。
+        if !crate::api_probe::api_requires_fixed_temperature(cfg.model.clone()) {
+            let safe_temp = crate::temperature::normalize_temperature(cfg.temperature);
+            body["temperature"] = json!(safe_temp);
+        }
         let max_tokens = cfg.max_tokens.unwrap_or(800);
         if max_tokens > 0 {
             let param = if self.uses_max_completion_tokens(cfg) {
@@ -696,7 +707,8 @@ impl NativeGateway {
             "system": system_text,
             "messages": anthro_messages,
             "max_tokens": cfg.max_tokens.unwrap_or(800),
-            "temperature": cfg.temperature.clamp(0.1, 1.5),
+            // 同 OpenAI 兼容路径：temperature 必须 2 位小数（见 temperature.rs）
+            "temperature": crate::temperature::normalize_temperature(cfg.temperature),
         });
         // 工具：OpenAI function 结构 → Anthropic tools（input_schema）。
         // tool_choice="none"（工作流/单轮生成场景）表示本轮不暴露工具，直接省略 tools。
@@ -2439,6 +2451,152 @@ mod tests {
         assert_eq!(content[1]["type"], "image_url");
         let url = content[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,aGVsbG8="));
+    }
+
+    // ── temperature 2 位小数（智谱清言 HTTP 400 回归）──
+    //
+    // 线上报障（2026-10-11）：智谱清言渠道聊天必失败
+    //   「HTTP 400: temperature参数非法 限制小数点[2]位」
+    // 根因：Room 把 Kotlin Float 写 SQLite REAL 时按 Float→Double 加宽
+    // （0.7f → 0.699999988079071），Rust 网关原样序列化 → 严格网关直接拒绝。
+    // 修复见 temperature.rs。以下测试从**序列化后的请求体字符串**旁路取证。
+
+    /// 构造指定 temperature 的配置行（provider 取报障渠道 ZHIPU）
+    fn temperature_row(temperature: f64) -> ApiConfigRow {
+        ApiConfigRow {
+            provider: "ZHIPU".into(),
+            api_key: "sk-1".into(),
+            extra_api_keys: String::new(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            model: "glm-4-flash".into(),
+            temperature,
+            max_tokens: None,
+            format_hint: String::new(),
+        }
+    }
+
+    fn temperature_request() -> crate::agent::AgentTurnRequest {
+        crate::agent::AgentTurnRequest {
+            group_id: None,
+            history_json: "[]".to_string(),
+            tools: vec![],
+            max_rounds: 1,
+            tool_choice: "auto".to_string(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        }
+    }
+
+    /// 取证 + 回归：Float 加宽伪影必须在写进请求体前归一到 2 位小数
+    #[test]
+    fn zhipu_openai_body_temperature_is_two_decimals() {
+        let widened = 0.7f32 as f64; // Room：Float 0.7 → SQLite REAL
+        assert_eq!(
+            format!("{widened}"),
+            "0.699999988079071",
+            "前提：Float 加宽确实带伪影（本修复的存在理由）"
+        );
+        let gw = NativeGateway::new(testutil::global_config(""));
+        let body = gw.build_openai_body(
+            &temperature_row(widened),
+            &[],
+            &json!([]),
+            "auto",
+            &temperature_request(),
+            false,
+        );
+        assert_eq!(body["temperature"], 0.7);
+        let serialized = body.to_string();
+        assert!(
+            serialized.contains("\"temperature\":0.7"),
+            "请求体应为干净的 2 位小数: {serialized}"
+        );
+        assert!(
+            !serialized.contains("0.699999988079071"),
+            "请求体仍带 Float 伪影（智谱清言会 400）: {serialized}"
+        );
+    }
+
+    /// 穷举 [0.10, 1.50]：任意两位小数配置都不得序列化出 >2 位小数
+    #[test]
+    fn openai_body_temperature_never_has_more_than_two_decimals() {
+        let gw = NativeGateway::new(testutil::global_config(""));
+        for hundredths in 10..=150i32 {
+            let raw = (hundredths as f32 / 100.0) as f64; // 模拟 Room 读出的加宽值
+            let body = gw.build_openai_body(
+                &temperature_row(raw),
+                &[],
+                &json!([]),
+                "auto",
+                &temperature_request(),
+                false,
+            );
+            let text = format!("{}", body["temperature"].as_f64().unwrap());
+            let decimals = text
+                .split_once('.')
+                .map(|(_, frac)| frac.trim_end_matches('0').len())
+                .unwrap_or(0);
+            assert!(decimals <= 2, "hundredths={hundredths} 产出 {text}（小数位 {decimals}）");
+        }
+    }
+
+    /// Anthropic 通道同样必须归一（与 api_probe 的 Anthropic 测试同源）
+    #[test]
+    fn anthropic_body_temperature_is_two_decimals() {
+        let widened = 0.85f32 as f64;
+        assert_eq!(format!("{widened}"), "0.8500000238418579");
+        let gw = NativeGateway::new(testutil::global_config(""));
+        let body = gw.build_anthropic_body(
+            &temperature_row(widened),
+            &[],
+            "SYSTEM",
+            &temperature_request(),
+            &json!([]),
+            "auto",
+        );
+        assert_eq!(body["temperature"], 0.85);
+        assert!(
+            !body.to_string().contains("0.8500000238418579"),
+            "Anthropic 请求体仍带 Float 伪影: {body}"
+        );
+    }
+
+    /// 固定温度模型（kimi-k2.6）不得携带 temperature——连接测试已按此判定通过，
+    /// 生成路径此前漏判 → Kimi 渠道「测试通过但聊天必 400」。
+    #[test]
+    fn openai_body_omits_temperature_for_fixed_temperature_model() {
+        let gw = NativeGateway::new(testutil::global_config(""));
+        for model in ["kimi-k2.6", "kimi-k2.6-turbo", "Moonshot-k2.6"] {
+            let mut row = temperature_row(0.7f32 as f64);
+            row.provider = "KIMI".into();
+            row.model = model.into();
+            let body = gw.build_openai_body(
+                &row,
+                &[],
+                &json!([]),
+                "auto",
+                &temperature_request(),
+                false,
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "model={model} 固定温度模型不应带 temperature: {body}"
+            );
+        }
+        // 对照：非固定温度模型仍带归一后的 temperature
+        let mut row = temperature_row(0.7f32 as f64);
+        row.model = "glm-4-flash".into();
+        let body = gw.build_openai_body(
+            &row,
+            &[],
+            &json!([]),
+            "auto",
+            &temperature_request(),
+            false,
+        );
+        assert_eq!(body["temperature"], 0.7);
     }
 
     #[test]
