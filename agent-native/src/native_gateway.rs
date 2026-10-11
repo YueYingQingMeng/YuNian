@@ -507,8 +507,13 @@ impl NativeGateway {
             let safe_temp = crate::temperature::normalize_temperature(cfg.temperature);
             body["temperature"] = json!(safe_temp);
         }
-        let max_tokens = cfg.max_tokens.unwrap_or(800);
-        if max_tokens > 0 {
+        // 复读惩罚（provider 门控，逐字段）：与 Kotlin ApiPenalty.kt 逐条同表。
+        // 该修复历史上只作用于已废弃的 Kotlin 请求路径，Rust 网关漏修 → 线上复读惩罚恒为 0。
+        crate::api_penalty::apply_repetition_penalty(&cfg.provider, &mut body);
+        // 仅当用户**显式配置**了 Max Tokens 才发送该字段（与 Kotlin 侧既有修复同语义）：
+        // 默认写死 800 会被推理模型整个消耗在思考过程上，导致 content 为空
+        // （「模型仅返回了思考过程」）。不配置就交给服务端使用模型默认输出上限。
+        if let Some(max_tokens) = cfg.max_tokens.filter(|v| *v > 0) {
             let param = if self.uses_max_completion_tokens(cfg) {
                 "max_completion_tokens"
             } else {

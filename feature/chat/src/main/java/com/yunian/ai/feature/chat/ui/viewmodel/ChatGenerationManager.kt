@@ -48,7 +48,6 @@ import com.yunian.ai.feature.chat.timeline.StreamingReasoningMessagePipeline
 import com.yunian.ai.feature.chat.voice.ChatTtsController
 import com.yunian.ai.feature.chat.voice.ChatTtsState
 import com.yunian.ai.network.ChatTypingState
-import com.yunian.ai.network.bubble.BubbleLoopRunner
 import com.yunian.ai.network.stream.NonStreamingAssistantStreamAdapter
 import com.yunian.ai.network.tts.ChatTtsConfig
 import com.yunian.ai.network.tts.ChatTtsMode
@@ -1028,8 +1027,10 @@ class ChatGenerationManager private constructor(
                     groupId = null,
                     historyJson = serializeHistoryJson(modelHistory),
                     tools = agentTools,
-                    // 气泡轮次预算：Rust 每轮产出 bubble/sticker 事件，由 AgentEvent 驱动连发
-                    maxRounds = BubbleLoopRunner.MAX_BUBBLES.toUInt(),
+                    // 单回合 **API 调用轮数**预算（与「气泡条数」护栏严格区分）：
+                    // 旧实现误用 BubbleLoopRunner.MAX_BUBBLES(=64 条气泡护栏) 当轮数，
+                    // 导致「预算还很充足」的错觉 → 连发失控、内容漂移（Issue #2 症状 2）。
+                    maxRounds = ChatConstants.AGENT_MAX_TOOL_ROUNDS.toUInt(),
                     // 首轮用 auto（不用 required）：DeepSeek thinking 模式拒绝 required
                     toolChoice = "auto",
                     stickerProbability = 0u,
@@ -1365,7 +1366,7 @@ class ChatGenerationManager private constructor(
             )
 
             // 气泡连发（追尾气泡）已由 Rust `AgentFacade.runTurn` 的 bubble 事件流承担：
-            // Agent 路径按 `BubbleLoopRunner.MAX_BUBBLES` 轮预算在 Rust 侧连发，
+            // Agent 路径按 `ChatConstants.AGENT_MAX_TOOL_ROUNDS` 轮预算在 Rust 侧连发，
             // 本 vision 分支为单轮图片理解，不产出追尾气泡。
             val allBubbleContent = aiContent
             responseFinalizer.afterDeliver(

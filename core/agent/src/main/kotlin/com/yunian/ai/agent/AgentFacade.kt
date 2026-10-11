@@ -443,7 +443,10 @@ object AgentFacade {
 1. 禁止一条气泡超过 14 个短句；内容多就拆成多条。
 2. 禁止连发重复内容：每条都是新信息增量。
 3. 禁止 markdown（`**`、`#`、列表符号）、禁止括号说明。
-4. 话说完/已提出问题 → 停止调用工具，直接返回短文本收尾。
+4. 禁止把思考过程 / 内心独白 / 推理分析写进 `emit_bubble` / `emit_segmented` 的 `text`：
+   气泡里**只能**是你要对用户说的话。像"嗯，等待用户回答""先分析一下用户意图"这类
+   元叙述一律不得输出——思考留给自己，不要发出去。
+5. 话说完/已提出问题 → 停止调用工具，直接返回短文本收尾，不要为凑条数继续输出。
 """.trimIndent()
 
     /**
@@ -492,7 +495,7 @@ object AgentFacade {
         return ok > 0
     }
 
-    private const val BUILTIN_CHAT_TOOL_SKILL_VERSION = 7
+    private const val BUILTIN_CHAT_TOOL_SKILL_VERSION = 8
 
     // ── Agent Memory（决策在 Rust：召回/评分/排序/整理；Kotlin 仅纯 IO） ──
 

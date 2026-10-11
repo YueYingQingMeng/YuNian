@@ -431,13 +431,28 @@ class IlinkClientManager(
 
     /**
      * 通知 context_token 已更新：纯 HTTP 下只需持久化到 sessionStore。
+     *
+     * 凭证是「能不能回复」的唯一前置（iLink 只能回复对方先发来的消息），因此**不允许静默
+     * 丢弃**：落库失败或会话未就绪时必须留证据，否则线上只能看到「AI 回了但微信没收到」，
+     * 无法区分「服务端没下发凭证」与「我们没存下来」——这正是用户报障时卡住的那一步。
      */
     suspend fun notifyContextTokenUpdated(userId: String, contextToken: String? = null) {
-        if (userId.isBlank()) return
-        val token = contextToken?.takeIf { it.isNotBlank() } ?: return
-        sessionStore.getSessionAccount()?.let { account ->
-            sessionStore.saveContextToken(account.accountId, userId, token)
+        if (userId.isBlank()) {
+            Log.w(TAG, "context_token dropped: blank user id")
+            return
         }
+        val token = contextToken?.takeIf { it.isNotBlank() }
+        if (token == null) {
+            Log.w(TAG, "context_token dropped: blank token for user=${maskId(userId)}")
+            return
+        }
+        val account = sessionStore.getSessionAccount()
+        if (account == null) {
+            Log.w(TAG, "context_token dropped: no session account, user=${maskId(userId)}")
+            return
+        }
+        sessionStore.saveContextToken(account.accountId, userId, token)
+        Log.i(TAG, "context_token saved user=${maskId(userId)} account=${account.accountId}")
     }
 
     /**

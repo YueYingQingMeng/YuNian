@@ -214,7 +214,10 @@ class WeChatOutboxCoordinatorTest {
 
         assertEquals(0, guardedCoordinator.drain())
         assertTrue(sendAttempts.isEmpty())
-        assertEquals("FAILED", dao.lastAttemptStatus)
+        // G4 修正：凭证缺失＝「等待对方下一条消息」，**不再判死**——保持 PENDING（健康卡显示
+        // 「待发」而非「失败」），凭证落库后自动补发；更不得计入失败次数。
+        assertEquals("PENDING", dao.lastAttemptStatus)
+        assertTrue(dao.lastAttemptError!!.contains("waiting_context_token"))
         assertTrue(dao.lastAttemptError!!.contains("context_token 缺失"))
     }
 
@@ -254,8 +257,68 @@ class WeChatOutboxCoordinatorTest {
 
         assertEquals(0, guardedCoordinator.drain())
         assertTrue(sendAttempts.isEmpty())
-        assertEquals("FAILED", dao.lastAttemptStatus)
+        // 同上：过期同样只是「等对方刷新凭证」，不判死
+        assertEquals("PENDING", dao.lastAttemptStatus)
+        assertTrue(dao.lastAttemptError!!.contains("waiting_context_token"))
         assertTrue(dao.lastAttemptError!!.contains("context_token 已过期"))
+    }
+
+    /** 存量迁移：老版本判死的「凭证缺失」行必须被复活为可发送（否则用户永远补不回来）。 */
+    @Test
+    fun reviveTokenBlockedDeadRows_reactivates_dead_token_rows_only() = runBlocking {
+        val dead = coordinator.buildEntities(
+            request = WeChatOutboundRequest(companionId = 1L, text = "hello"),
+            wechatUserId = "user-1",
+            rootId = "dead-token",
+            createdAtMs = 1L,
+        ).map {
+            it.copy(
+                status = "FAILED",
+                lastError = "outbox_dead: " + WeChatOutboxCoordinator.SEND_BLOCKED_NO_TOKEN,
+                nextAttemptAtMs = WeChatOutboxRecovery.NEVER_RETRY_AT_MS,
+            )
+        }
+        val otherDead = coordinator.buildEntities(
+            request = WeChatOutboundRequest(companionId = 1L, text = "hi"),
+            wechatUserId = "user-1",
+            rootId = "dead-session",
+            createdAtMs = 1L,
+        ).map {
+            it.copy(
+                status = "FAILED",
+                lastError = "outbox_dead: 微信会话已过期（errcode=-14），请重新扫码登录",
+                nextAttemptAtMs = WeChatOutboxRecovery.NEVER_RETRY_AT_MS,
+            )
+        }
+        val dao = FakeOutboxDao(dead + otherDead)
+        val c = WeChatOutboxCoordinator(
+            dao = dao,
+            transport = object : WeChatTransportPort {
+                override suspend fun sendText(toUserId: String, text: String, contextToken: String?) =
+                    Result.success(Unit)
+
+                override suspend fun sendImage(
+                    toUserId: String,
+                    imageBytes: ByteArray,
+                    fileName: String,
+                    description: String?,
+                    contextToken: String?,
+                ) = Result.success(Unit)
+            },
+            sessionStore = FakeSessionStore(contextToken = null),
+        )
+
+        assertEquals(1, c.reviveTokenBlockedDeadRows())
+        val revived = dao.attempts.last { it.status == "PENDING" }
+        assertEquals(0, revived.retryCount)
+        assertEquals(0L, revived.nextAttemptAtMs)
+        assertTrue(revived.lastError!!.contains("revived_from_dead"))
+        assertTrue(revived.lastError!!.contains("context_token 缺失"))
+        // 会话过期（errcode=-14）不在复活范围：重扫前重试必然失败，不该被改写
+        assertTrue(
+            "会话过期行不得被复活",
+            dao.attempts.none { it.status == "PENDING" && it.lastError.orEmpty().contains("errcode=-14") },
+        )
     }
 
     @Test
@@ -684,8 +747,10 @@ private class FakeOutboxDao(
 
     override suspend fun countOpen(): Int = 0
     override suspend fun countByStatus(status: String): Int = 0
-    override suspend fun listRecentFailed(limit: Int) =
-        emptyList<com.yunian.ai.database.model.WeChatOutboxEntity>()
+    override suspend fun listRecentFailed(limit: Int) = store
+        .filter { it.status == "FAILED" }
+        .sortedByDescending { it.updatedAtMs }
+        .take(limit)
     override suspend fun deleteSentBefore(cutoffMs: Long): Int = 0
     override suspend fun deleteDeadBefore(maxRetry: Int, cutoffMs: Long): Int = 0
     override suspend fun listMediaLocalPaths(): List<String> = emptyList()

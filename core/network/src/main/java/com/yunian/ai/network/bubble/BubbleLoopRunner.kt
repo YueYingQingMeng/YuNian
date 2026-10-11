@@ -54,6 +54,11 @@ class BubbleLoopRunner(
          * 单轮连发气泡的**兜底安全上限**（非产品限流）：条数本身由模型 `continue` 自决，
          * 该值只在模型失控连发时兜底——注意链式连发的每一条都是一次独立的模型调用，
          * 因此保留一个高水位护栏（用户要求「条数不限」，常规聊天远达不到此值）。
+         *
+         * ⚠️ 这是**气泡条数**护栏，**不是** Agent 回合的 API 调用轮数预算。
+         * 历史上单聊把它直接当 `maxRounds` 传给 Rust 循环（Issue #2 症状 2：连发失控、
+         * 内容逐轮漂移）。轮数预算请用
+         * [com.yunian.ai.common.ChatConstants.AGENT_MAX_TOOL_ROUNDS]。
          */
         const val MAX_BUBBLES = 64
 
