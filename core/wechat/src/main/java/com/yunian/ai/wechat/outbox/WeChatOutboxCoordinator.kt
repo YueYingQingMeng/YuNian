@@ -42,6 +42,10 @@ class WeChatOutboxCoordinator(
     @Volatile
     private var staleSendingRecoveryDone = false
 
+    /** 每个进程只做一次「凭证判死行」复活（同理：drain 高频调用）。 */
+    @Volatile
+    private var tokenBlockedRevivalDone = false
+
     suspend fun enqueue(
         request: WeChatOutboundRequest,
         wechatUserId: String = request.wechatUserId.orEmpty(),
@@ -65,6 +69,10 @@ class WeChatOutboxCoordinator(
         // 恢复失败不能连累正常 drain，因此整体 runCatching。
         runCatching { recoverStaleSendingOnce() }
             .onFailure { SecureLog.w(TAG, "stale_sending recovery failed: ${it.message}") }
+        // 再复活历史「因缺 context_token 被判死」的行（本进程一次）：老版本的判死永不可逆，
+        // 用户即使后来正常收到凭证，那批回复也永远不会再发出去（Issue #2 关联故障）。
+        runCatching { reviveTokenBlockedDeadRowsOnce() }
+            .onFailure { SecureLog.w(TAG, "token-blocked revival failed: ${it.message}") }
 
         val ready = dao.listReady(nowMs = nowMs(), limit = limit)
         var sent = 0
@@ -133,6 +141,43 @@ class WeChatOutboxCoordinator(
         if (!staleSendingRecoveryEnabled || staleSendingRecoveryDone) return
         recoverStaleSending()
         staleSendingRecoveryDone = true
+    }
+
+    /**
+     * 复活历史上「因缺 context_token 被判死」的行：状态回到 PENDING、立即到期、失败计数清零。
+     *
+     * 为什么必须做：旧实现把「凭证缺失/过期」当 non-retryable 直接判死
+     * （FAILED + `NEVER_RETRY_AT_MS`），而凭证完全可能在下一条入站消息时重新落库——
+     * 判死之后这些回复**永远不会再发**，用户看到的就是「一直在发消息，AI 就是同步不到微信」。
+     * 修复本身（[updateFailure] 走挂起）只对**新**失败生效，因此这里对存量行做一次性迁移。
+     *
+     * 每个进程只做一次（由 [drain] 串行调用），扫描上限 [TOKEN_REVIVAL_SCAN_LIMIT]。
+     *
+     * @return 被复活的行数（0 = 没有历史判死行，或本进程已复活过）
+     */
+    suspend fun reviveTokenBlockedDeadRows(limit: Int = TOKEN_REVIVAL_SCAN_LIMIT): Int {
+        val dead = dao.listRecentFailed(limit).filter { isContextTokenWaitMessage(it.lastError) }
+        if (dead.isEmpty()) return 0
+        val now = nowMs()
+        for (row in dead) {
+            dao.updateAttempt(
+                id = row.id,
+                status = WeChatDeliveryStatus.PENDING.name,
+                retryCount = 0,
+                nextAttemptAtMs = 0L, // 立即到期：凭证若已存在，本轮 drain 就会发出去
+                lastError = "$WAITING_CONTEXT_TOKEN: revived_from_dead: ${row.lastError.orEmpty().take(120)}",
+                updatedAtMs = now,
+            )
+        }
+        SecureLog.i(TAG, "revived token-blocked dead rows count=${dead.size}")
+        staleSendingRecoveryObserver?.invoke(dead.size, 0)
+        return dead.size
+    }
+
+    private suspend fun reviveTokenBlockedDeadRowsOnce() {
+        if (tokenBlockedRevivalDone) return
+        reviveTokenBlockedDeadRows()
+        tokenBlockedRevivalDone = true
     }
 
     private suspend fun dispatchTextSegments(items: List<WeChatOutboxEntity>): Int {
@@ -280,6 +325,31 @@ class WeChatOutboxCoordinator(
 
     private suspend fun updateFailure(item: WeChatOutboxEntity, error: Throwable?) {
         val raw = error?.message ?: "send failed"
+
+        // ── 「等待对方下一条消息」≠ 失败（G4 修正）──
+        // iLink 协议只能回复对方先发来的消息：没有 context_token 时**任何重试都发不出去**，
+        // 但对方下一条消息一到，凭证就会重新落库、本条立刻可发。
+        // 旧实现把它当 non-retryable 判死（FAILED + NEVER_RETRY_AT_MS）→ 永不复活，
+        // 用户看到的是「一直在发消息，AI 就是同步不到微信」，且健康卡把原因推给用户
+        // （「对方尚未给机器人发过消息」），把排查引向无用的反复重绑。
+        // 现改为**挂起**：保留 PENDING、不计失败次数、退避后自动重试。
+        if (isContextTokenWait(error)) {
+            dao.updateAttempt(
+                id = item.id,
+                status = WeChatDeliveryStatus.PENDING.name,
+                retryCount = item.retryCount, // 不计入失败次数：这是等待，不是失败
+                nextAttemptAtMs = nowMs() + CONTEXT_TOKEN_WAIT_BACKOFF_MS,
+                lastError = "$WAITING_CONTEXT_TOKEN: ${raw.take(160)}",
+                updatedAtMs = nowMs(),
+            )
+            SecureLog.i(
+                TAG,
+                "waiting token id=${item.id.take(8)} user=${maskUser(item.wechatUserId)} " +
+                    "retry=${item.retryCount} backoff=${CONTEXT_TOKEN_WAIT_BACKOFF_MS}ms err=$raw",
+            )
+            return
+        }
+
         val nextRetry = item.retryCount + 1
         val nonRetryable = isNonRetryable(error)
         val reason = if (nextRetry >= maxRetry || nonRetryable) {
@@ -318,6 +388,15 @@ class WeChatOutboxCoordinator(
         }
     }
 
+    /**
+     * 这次失败是否只是「还没有会话凭证」（可等待，不判死）。
+     *
+     * 命中两条发送前拦截文案（[SEND_BLOCKED_NO_TOKEN] / [SEND_BLOCKED_EXPIRED]）
+     * 或 SDK 的 missing token 报错时成立。
+     */
+    private fun isContextTokenWait(error: Throwable?): Boolean =
+        isContextTokenWaitMessage(error?.message)
+
     private fun isNonRetryable(error: Throwable?): Boolean {
         // iLink 会话过期（errcode=-14）：重新扫码前重试必然失败，直接判死
         if (error is IlinkSessionExpiredException) return true
@@ -355,16 +434,48 @@ class WeChatOutboxCoordinator(
         const val SEND_BLOCKED_EXPIRED =
             "context_token 已过期（会话超过 24 小时）：请让对方重新发送一条消息后再试"
 
+        /**
+         * 「等待对方下一条消息」的挂起退避。
+         *
+         * 该状态下**不发网络请求**（发送前拦截），每次重试只是一次本地凭证查询，
+         * 因此退避取 1 分钟：对方发来消息后最迟 1 分钟内自动补发，代价可忽略。
+         */
+        const val CONTEXT_TOKEN_WAIT_BACKOFF_MS = 60_000L
+
+        /** 挂起行的 lastError 前缀（健康卡/日志据此区分「等待」与「失败」）。 */
+        const val WAITING_CONTEXT_TOKEN = "waiting_context_token"
+
+        /** 复活历史判死行的单次扫描上限（够覆盖一次会话的积压，且不会一次写太多）。 */
+        const val TOKEN_REVIVAL_SCAN_LIMIT = 50
+
+        /**
+         * 该错误是否只是「还没有会话凭证」——可等待（不判死），凭证一到即可发送。
+         *
+         * 命中两条发送前拦截文案或 SDK 的 missing token 报错时成立；供 [updateFailure]
+         * 与历史行复活（[WeChatOutboxCoordinator.reviveTokenBlockedDeadRows]）共用。
+         */
+        fun isContextTokenWaitMessage(message: String?): Boolean {
+            val lower = message?.lowercase() ?: return false
+            return TOKEN_WAIT_MARKERS.any { lower.contains(it) }
+        }
+
         private const val SENT_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
 
-        // 统一小写匹配（isNonRetryable 会 lowercase）
+        /** 凭证等待标记（统一小写匹配）。 */
+        private val TOKEN_WAIT_MARKERS = listOf(
+            "context_token 缺失",
+            "contexttoken 缺失",
+            "missing latest context token",
+            "context_token 已过期",
+            "contexttoken 已过期",
+        )
+
+        // 统一小写匹配（isNonRetryable 会 lowercase）。
+        // 注意：context_token 缺失/过期**不在**此列——它们走「挂起等待」而非判死
+        // （见 updateFailure 的 G4 修正与 TOKEN_WAIT_MARKERS）。
         private val NON_RETRYABLE_MARKERS = listOf(
             "未登录",
             "errcode=-14",
-            "context_token 缺失",
-            "context_token 已过期",
-            "contexttoken 缺失",
-            "missing latest context token",
         )
 
         private fun maskUser(userId: String): String {

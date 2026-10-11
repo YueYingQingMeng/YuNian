@@ -385,7 +385,8 @@ impl ApiProbe {
                 "messages": anthro_messages,
                 "system": system_prompt,
                 "max_tokens": 5,
-                "temperature": cfg.temperature,
+                // 同生成路径：连接测试的 temperature 同样必须 2 位小数（见 temperature.rs）
+                "temperature": crate::temperature::normalize_temperature(cfg.temperature),
             });
 
             let mut headers = Vec::new();

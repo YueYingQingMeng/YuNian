@@ -25,6 +25,39 @@ const MAX_TOOL_CALLS_PER_TURN: u32 = 64;
 /// 单回合气泡文本总字符上限（超过即终止，防止无限产出）
 const MAX_BUBBLE_CHARS_PER_TURN: usize = 8000;
 
+/// 连续「只产出气泡、没有正式正文」的轮数达到该值时，注入一条强制收尾提示。
+///
+/// 背景（Issue #2 症状 2）：模型每调一次气泡工具，工具就回灌「已输出气泡」，
+/// 循环继续，**唯一停止条件是模型自己收手**（硬上限 64 轮 / 8000 字符）。
+/// 连续多轮纯气泡是「越说越多、越说越跑偏」的典型前兆，因此在第 K 轮后
+/// 主动提示模型用一条文字收尾，而不是让它一路跑到轮数上限。
+const PURE_BUBBLE_ROUNDS_BEFORE_NUDGE: u32 = 3;
+
+/// 气泡事件**唯一出口**：统一剥离思考块后再产出（见 `thinking.rs`）。
+///
+/// Issue #2 症状 1 的根治点：`emit_bubble` / `emit_segmented` / 正文补发 / 最终正文
+/// 四条出口都必须经由本函数，禁止各自 `events.push`——否则「思考过程泄漏进回复气泡」
+/// 会在任何一条新出口上重新出现。
+///
+/// 剥离后余文为空（整条都是思考）→ **不产出气泡**（不伪造内容），返回 `false`。
+fn push_bubble(events: &mut Vec<AgentEvent>, text: &str) -> bool {
+    let cleaned = crate::thinking::strip_thinking_blocks(text);
+    if cleaned.is_empty() {
+        return false;
+    }
+    events.push(AgentEvent {
+        kind: "bubble".to_string(),
+        text: cleaned,
+        extra: String::new(),
+    });
+    true
+}
+
+/// 是否属于「气泡协议工具」（只负责把文本切成气泡输出，不推进任务本身）。
+fn is_bubble_protocol_tool(name: &str) -> bool {
+    matches!(name, "emit_bubble" | "emit_segmented")
+}
+
 /// 工具类别（用于确认策略等治理）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ToolCategory {
@@ -183,8 +216,12 @@ pub trait TurnStateController: Send + Sync {
 
 /// 默认回合状态机（Rust 内置，向后兼容）：
 /// - 不主动 Stop（由 max_rounds 兜底，保持现有循环语义）
-/// - 产出 [回合状态 N/M] 摘要（含工具调用次数与产出字数）
+/// - 产出状态摘要（含工具调用次数与产出字数），**不暴露「N/上限」分母**
 /// - 不覆盖 tool_choice
+///
+/// 分母脱敏的依据（Issue #2 症状 2）：旧文案 `[回合状态 3/64]` 让模型误以为
+/// 「预算还很充足、应当继续输出」，是「越说越多、越说越跑偏」的直接推手。
+/// 现在文案只描述**已产出的内容**，并明确「够了就自然收尾」。
 #[derive(uniffi::Object)]
 pub struct DefaultTurnStateMachine;
 
@@ -212,7 +249,10 @@ impl TurnStateController for DefaultTurnStateMachine {
         };
         TurnStateDecision {
             action: TurnAction::Continue,
-            status_text: format!("[回合状态 {}/{}]{}", ctx.round, ctx.max_rounds, detail),
+            // 不写轮次分母：只报「已产出什么」，并给出收尾指引。
+            status_text: format!(
+                "[回合状态{detail}] 内容已足够表达时请直接用一条文字自然收尾，不要为凑数继续输出"
+            ),
             tool_choice_override: String::new(),
         }
     }
@@ -364,17 +404,19 @@ impl AgentToolRegistry {
             .and_then(|v| v.as_str())
             .unwrap_or("simple");
         let split_mode = if mode == "group" { SplitMode::Group } else { SplitMode::Simple };
-        let segments = agent_segment(text.clone(), split_mode);
+        // 先剥思考块再分段：否则同一段思考会被拆进多条气泡（见 thinking.rs）
+        let cleaned = crate::thinking::strip_thinking_blocks(&text);
+        let segments = agent_segment(cleaned.clone(), split_mode);
+        let mut emitted = 0usize;
         for seg in segments {
-            if !seg.is_empty() {
-                events.push(AgentEvent {
-                    kind: "bubble".to_string(),
-                    text: seg,
-                    extra: String::new(),
-                });
+            if push_bubble(events, &seg) {
+                emitted += 1;
             }
         }
-        format!("已将回复分段输出为 {} 条气泡", events.iter().filter(|e| e.kind == "bubble").count())
+        if emitted == 0 {
+            return "错误：气泡内容为空（思考内容不得作为气泡输出，请把正式回复写进 text）".to_string();
+        }
+        format!("已将回复分段输出为 {emitted} 条气泡")
     }
 
     fn builtin_send_sticker(
@@ -553,11 +595,10 @@ impl AgentToolRegistry {
         if text.is_empty() {
             return "错误：缺少 text 参数".to_string();
         }
-        events.push(AgentEvent {
-            kind: "bubble".to_string(),
-            text,
-            extra: String::new(),
-        });
+        // 唯一出口：剥离思考块。整条都是思考 → 如实报错并给出协议指引（不得静默产出）
+        if !push_bubble(events, &text) {
+            return "错误：气泡内容为空（思考内容不得作为气泡输出，请把正式回复写进 text）".to_string();
+        }
         "已输出气泡".to_string()
     }
 
@@ -1130,6 +1171,9 @@ impl AgentRuntime {
         // 模型第二轮不得用相反文本把成功误报为失败。仅记录严格 JSON 成功契约；
         // 失败/未知/旧格式均不触发，避免把真实失败改写成成功。
         let mut channel_send_succeeded = false;
+        // 连续「纯气泡」轮计数与「已注入收尾提示」标志（见 PURE_BUBBLE_ROUNDS_BEFORE_NUDGE）
+        let mut pure_bubble_streak: u32 = 0;
+        let mut bubble_nudge_sent = false;
 
         while rounds_used < max_rounds {
             rounds_used += 1;
@@ -1325,16 +1369,19 @@ impl AgentRuntime {
                         )
                     });
                     if !uses_bubble_protocol {
-                        events.push(AgentEvent {
-                            kind: "bubble".to_string(),
-                            text: content.clone(),
-                            extra: String::new(),
-                        });
+                        // 唯一出口：正文补发同样要剥思考块（否则本出口成为泄漏旁路）
+                        push_bubble(&mut events, &content);
                     }
                 }
                 let mut tool_messages: Vec<serde_json::Value> = Vec::new();
+                // 本轮是否「纯气泡轮」（只调用了气泡协议工具，没有任何其他进展）——
+                // 用于连续 K 轮后注入强制收尾提示（见 PURE_BUBBLE_ROUNDS_BEFORE_NUDGE）。
+                let mut round_bubble_only = true;
                 for call in &tool_calls {
                     let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !is_bubble_protocol_tool(&name) {
+                        round_bubble_only = false;
+                    }
                     let args = call
                         .get("arguments")
                         .and_then(|v| v.as_str())
@@ -1476,6 +1523,26 @@ impl AgentRuntime {
                 if let Some(reasoning) = parsed.get("reasoning_content").and_then(|v| v.as_str()) {
                     assistant_message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
                 }
+                // 连续纯气泡轮计数：达到阈值注入一次「立即用文字收尾」提示。
+                // 依据（Issue #2 症状 2）：纯气泡轮是「越说越多、越说越跑偏」的前兆，
+                // 而循环的唯一停止条件此前是模型自己收手（硬上限 64 轮 / 8000 字符）。
+                if round_bubble_only {
+                    pure_bubble_streak += 1;
+                } else {
+                    pure_bubble_streak = 0;
+                    bubble_nudge_sent = false;
+                }
+                if pure_bubble_streak >= PURE_BUBBLE_ROUNDS_BEFORE_NUDGE && !bubble_nudge_sent {
+                    bubble_nudge_sent = true;
+                    messages.push(serde_json::json!({
+                        "type": "system",
+                        "role": "system",
+                        "_agent_preserve_system": true,
+                        "content": format!(
+                            "系统提示：你已连续 {PURE_BUBBLE_ROUNDS_BEFORE_NUDGE} 轮只输出气泡、没有给出正式回复。请**立即停止继续拆分气泡**，用一条完整文字回复结束本轮；不要再调用 emit_bubble / emit_segmented。"
+                        ),
+                    }));
+                }
                 messages.push(assistant_message);
                 messages.extend(tool_messages);
                 continue;
@@ -1483,14 +1550,13 @@ impl AgentRuntime {
 
             // 正常文本 → 产出 bubble 事件，结束。通道发送已成功时，发布前做事实一致性校验：
             // 模型可以自然表达，但不能把刚完成的副作用反说成失败。
-            let content = reconcile_channel_send_statement(content, channel_send_succeeded);
-            if !content.is_empty() {
-                events.push(AgentEvent {
-                    kind: "bubble".to_string(),
-                    text: content.clone(),
-                    extra: String::new(),
-                });
-            }
+            let raw_content = reconcile_channel_send_statement(content, channel_send_succeeded);
+            // 思考剥离后的正文才是本回合的「可见文本」——final_text、空回复判断、气泡出口
+            // 三处必须用**同一个值**。此前只在 push_bubble 内部剥离、外层继续用原文，导致
+            // 「整段都是 <thinking>」时：气泡为空 + content 非空 → 跳过空回复判断 →
+            // 以 completed 结束并把思考原文带进 final_text（通道侧会直接展示它）。
+            let content = crate::thinking::strip_thinking_blocks(&raw_content);
+            push_bubble(&mut events, &content);
             // ── 修1：finish_reason 合法性判断 ──
             // parse_openai_response 把模型/API 错误平铺为 finish_reason="error"（含 error 字段）：
             // 不得标记为 completed，原样上报错误。
@@ -1516,7 +1582,11 @@ impl AgentRuntime {
             if content.is_empty() {
                 let has_output = events.iter().any(|e| e.kind == "bubble" || e.kind == "sticker");
                 if !has_output {
-                    let msg = if finish_reason == "length" {
+                    // 原文非空但剥离后为空 = 本轮**只写了思考**：给模型一条可执行的纠正指令，
+                    // 而不是笼统的「空响应」（这类回复会稳定复现，提示必须指向真实原因）。
+                    let msg = if !raw_content.trim().is_empty() {
+                        "模型本轮只输出了思考内容、没有可见回复（思考不得作为回复内容）：请把正式回复写在思考之外，不要只输出思考过程".to_string()
+                    } else if finish_reason == "length" {
                         "模型输出被 max_tokens 截断且未产生任何可见内容（finish_reason=length）——思考型模型可能把预算耗在推理上，请提高该 API 的最大输出（max_tokens）后重试".to_string()
                     } else {
                         format!("模型返回空响应（finish_reason={finish_reason:?}）")
@@ -2021,6 +2091,173 @@ mod tests {
         assert!(events.iter().filter(|e| e.kind == "bubble").count() >= 2, "{out} {events:?}");
     }
 
+    /// Issue #2 症状 1 回归：`emit_bubble` 收到的文本若含思考块，气泡必须只带正式正文。
+    #[test]
+    fn emit_bubble_strips_thinking_blocks() {
+        let reg = AgentToolRegistry::new();
+        let ctx = ToolContext::default();
+        let mut events = Vec::new();
+        let out = AgentToolRegistry::builtin_emit_bubble(
+            &reg,
+            &ctx,
+            &NoopHost,
+            r#"{"text":"<thinking>先想想怎么回</thinking>好呀，我在呢"}"#,
+            &mut events,
+        );
+        let bubbles: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(bubbles, vec!["好呀，我在呢"], "思考块必须被剥离: {out} {events:?}");
+        assert!(!out.contains("错误"), "{out}");
+    }
+
+    /// Issue #2 症状 1 回归：整条都是思考 → **不产出气泡**（不伪造内容）且如实报错。
+    #[test]
+    fn emit_bubble_rejects_pure_thinking_text() {
+        let reg = AgentToolRegistry::new();
+        let ctx = ToolContext::default();
+        let mut events = Vec::new();
+        let out = AgentToolRegistry::builtin_emit_bubble(
+            &reg,
+            &ctx,
+            &NoopHost,
+            r#"{"text":"<thinking>嗯，等待用户回答"}"#,
+            &mut events,
+        );
+        assert!(events.is_empty(), "纯思考不得产出气泡: {events:?}");
+        assert!(out.contains("思考内容不得作为气泡输出"), "{out}");
+    }
+
+    /// Issue #2 症状 1 回归：`emit_segmented` 必须先剥思考再分段，
+    /// 否则思考会被切进多条气泡。
+    #[test]
+    fn emit_segmented_strips_thinking_before_splitting() {
+        let reg = AgentToolRegistry::new();
+        let ctx = ToolContext::default();
+        let mut events = Vec::new();
+        let out = AgentToolRegistry::builtin_emit_segmented(
+            &reg,
+            &ctx,
+            &NoopHost,
+            r#"{"text":"<thinking>先分析用户意图再决定怎么回</thinking>今天天气真好呀。我们去散步吧！"}"#,
+            &mut events,
+        );
+        let joined = events.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("");
+        assert!(!joined.contains("思考") && !joined.contains("分析用户意图"), "思考不得进入气泡: {out} {events:?}");
+        assert!(joined.contains("天气真好"), "{out} {events:?}");
+    }
+
+    /// Issue #2 症状 2 回归：连续 3 轮「纯气泡」后，下一轮请求必须带上强制收尾提示
+    /// （此前唯一停止条件是模型自己收手，会一路跑到轮数上限）。
+    #[test]
+    fn pure_bubble_rounds_trigger_forced_wrapup_nudge() {
+        let (runner, gw, transport) = mock_gateway(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"emit_bubble","arguments":"{\"text\":\"第一句\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"emit_bubble","arguments":"{\"text\":\"第二句\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c3","type":"function","function":{"name":"emit_bubble","arguments":"{\"text\":\"第三句\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"好了，就说这么多～"},"finish_reason":"stop"}]}"#,
+        ]);
+        let req = AgentTurnRequest {
+            group_id: None,
+            history_json: r#"[]"#.to_string(),
+            tools: vec![],
+            max_rounds: 6,
+            tool_choice: String::new(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        };
+        let result = runner.run_turn_inner(&req, Some(1), &gw, None, &NoopHost, &DefaultTurnStateMachine);
+        assert_eq!(result.finished_reason, "completed", "{result:?}");
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests.len() >= 4, "应至少发起 4 轮请求: {}", requests.len());
+        // 第 3 轮处理完（连续 3 轮纯气泡）后注入 → 第 4 轮请求可见
+        let fourth: serde_json::Value = serde_json::from_str(&requests[3].2).unwrap();
+        let msgs = fourth.get("messages").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            msgs.iter().any(|m| m
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .contains("立即停止继续拆分气泡")),
+            "连续纯气泡后必须注入强制收尾提示: {fourth}"
+        );
+        // 提示必须是保留型 system 消息（与既有通道一致，不被 persona 重建清掉）
+        assert!(msgs.iter().any(|m| m
+            .get("_agent_preserve_system")
+            .and_then(|v| v.as_bool())
+            == Some(true)));
+    }
+
+    /// Issue #2 症状 1 回归（**最终正文出口**）：整段回复只有思考块时，
+    /// 必须以「只有思考、没有可见回复」判 error 结束，且 `final_text` 不得带思考原文
+    /// ——通道侧直接展示 `final_text`，这里若放行就等于没修。
+    #[test]
+    fn thinking_only_final_text_is_error_and_never_leaks_to_final_text() {
+        let (runner, gw, _transport) = mock_gateway(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":"<thinking>嗯，等待用户回答</thinking>"},"finish_reason":"stop"}]}"#,
+        ]);
+        let req = AgentTurnRequest {
+            group_id: None,
+            history_json: r#"[]"#.to_string(),
+            tools: vec![],
+            max_rounds: 3,
+            tool_choice: String::new(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        };
+        let result = runner.run_turn_inner(&req, Some(1), &gw, None, &NoopHost, &DefaultTurnStateMachine);
+        assert_eq!(
+            result.finished_reason, "error",
+            "纯思考回复不得以 completed 结束: {result:?}"
+        );
+        assert!(
+            result.final_text.is_empty(),
+            "final_text 不得携带思考原文: {}",
+            result.final_text
+        );
+        assert!(
+            result.events.iter().all(|e| e.kind != "bubble"),
+            "纯思考不得产出气泡: {:?}",
+            result.events
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("只输出了思考内容"),
+            "错误文案必须指向真实原因（只输出思考）: {err}"
+        );
+    }
+
+    /// 对照：正文含思考块但仍有可见回复时 → 正常 completed，且 final_text 只有可见部分。
+    #[test]
+    fn final_text_is_sanitized_when_reply_has_visible_part() {
+        let (runner, gw, _transport) = mock_gateway(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":"<thinking>先想想</thinking>今晚吃火锅吗？"},"finish_reason":"stop"}]}"#,
+        ]);
+        let req = AgentTurnRequest {
+            group_id: None,
+            history_json: r#"[]"#.to_string(),
+            tools: vec![],
+            max_rounds: 3,
+            tool_choice: String::new(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        };
+        let result = runner.run_turn_inner(&req, Some(1), &gw, None, &NoopHost, &DefaultTurnStateMachine);
+        assert_eq!(result.finished_reason, "completed", "{result:?}");
+        assert_eq!(result.final_text, "今晚吃火锅吗？");
+        let bubbles: Vec<&str> = result
+            .events
+            .iter()
+            .filter(|e| e.kind == "bubble")
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(bubbles, vec!["今晚吃火锅吗？"]);
+    }
+
     /// 空表情库（可用标签为空）且预选失败 → **绝不产出 sticker 事件**。
     ///
     /// 旧行为会透传事件，Kotlin 落地时按描述模糊匹配内置表情，于是恒发同一张
@@ -2234,8 +2471,18 @@ mod tests {
         let msgs = first_body.get("messages").and_then(|v| v.as_array()).unwrap();
         assert!(
             msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")
-                && m.get("content").and_then(|c| c.as_str()).unwrap_or("").contains("[回合状态 1/3]")),
-            "首轮应注入 [回合状态 1/3] system 消息: {first_body}"
+                && m.get("content").and_then(|c| c.as_str()).unwrap_or("").contains("[回合状态")),
+            "首轮应注入 [回合状态] system 消息: {first_body}"
+        );
+        // Issue #2 症状 2 回归：状态消息**不得**再暴露「N/上限」分母
+        // （旧文案 [回合状态 1/3] 会让模型误以为预算充足、应当继续输出）
+        assert!(
+            !msgs.iter().any(|m| m
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .contains("1/3")),
+            "状态消息不得含轮次分母: {first_body}"
         );
     }
 
@@ -2337,9 +2584,15 @@ mod tests {
             last_tool_results: String::new(),
         });
         assert_eq!(d.action, TurnAction::Continue);
-        assert!(d.status_text.contains("[回合状态 3/5]"));
+        assert!(d.status_text.contains("[回合状态"));
         assert!(d.status_text.contains("已调用 2 次工具"));
         assert!(d.status_text.contains("已输出 46 字"));
+        // Issue #2 症状 2 回归：不得出现「轮次/上限」分母
+        assert!(
+            !d.status_text.contains("3/5"),
+            "状态文案不得暴露轮次分母: {}",
+            d.status_text
+        );
         assert!(d.tool_choice_override.is_empty());
     }
 

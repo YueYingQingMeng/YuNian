@@ -367,6 +367,8 @@ object WeChatChannelHealthAlerts {
 
     const val SEND_FAILED_HEADLINE = "微信消息发送失败"
 
-    private const val TOKEN_NO_TOKEN_CAUSE = "原因：对方尚未给机器人发过消息"
+    private const val TOKEN_NO_TOKEN_CAUSE =
+        "原因：本会话没有可用的会话凭证（context_token）。iLink 只能回复对方先发来的消息——" +
+            "若对方已给机器人发过消息仍报此项，说明服务端未下发凭证，此时重新绑定无效，请导出日志反馈"
     private const val TOKEN_EXPIRED_CAUSE = "原因：context_token 超过 24 小时未刷新"
 }

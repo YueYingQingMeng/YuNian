@@ -77,8 +77,14 @@ class GroupChatViewModel(
     private val userRepository = ServiceRegistry.getOrThrow(UserRepository::class.java)
     private val apiConfigRepository = ServiceRegistry.getOrThrow(ApiConfigRepository::class.java)
 
-    /** 群聊单次 Agent 回合的并行气泡预算（Rust 多轮 emit_bubble 循环上界）。 */
-    private val bubbleLoopMaxRounds: UInt = 16u
+    /**
+     * 群聊单次 Agent 回合的 **API 调用轮数**上限（Rust 多轮 emit_bubble 循环上界）。
+     *
+     * 与单聊同源：此前群聊用 16、单聊误用 `BubbleLoopRunner.MAX_BUBBLES`(=64 条气泡护栏)，
+     * 都是把「气泡条数」当成「轮数」——连续多轮纯气泡会让内容逐轮漂移
+     * （Issue #2 症状 2）。现统一取 [ChatConstants.AGENT_MAX_TOOL_ROUNDS]。
+     */
+    private val maxToolRounds: UInt = ChatConstants.AGENT_MAX_TOOL_ROUNDS.toUInt()
 
     /** 确认门守卫（Commerce 工具在群聊回合上 fail-closed 自动拒绝 + 有限次重跑，与通道侧同一实现）。 */
     private val agentConfirmGuard = AgentConfirmGuard()
@@ -936,7 +942,7 @@ class GroupChatViewModel(
             groupId = groupId,
             historyJson = serializeHistoryJson(filteredSnapshot.map { it.toAiChatMessage() }),
             tools = tools,
-            maxRounds = bubbleLoopMaxRounds,
+            maxRounds = maxToolRounds,
             toolChoice = "auto",
             stickerProbability = 0u,
             image = null,

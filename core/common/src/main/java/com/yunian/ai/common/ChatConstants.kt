@@ -82,6 +82,21 @@ object ChatConstants {
      */
     const val CHAT_TOOL_LOOP_MAX_ROUNDS = 6
 
+    /**
+     * Cordis Agent（Rust）单回合的 **API 调用轮数**上限。
+     *
+     * 为什么必须与「气泡数」分开（Issue #2 症状 2 的根因）：
+     * 此前单聊把 `BubbleLoopRunner.MAX_BUBBLES`（本意＝连发**气泡条数**护栏，64）
+     * 直接当作 `maxRounds` 传进 Rust 循环，于是「气泡数预算」被解释成「可以调 64 次 API」；
+     * 而 Rust 循环唯一的停止条件是模型自己收手 → 一轮回复能拆出十几条气泡、内容逐轮漂移。
+     *
+     * 取值依据：正常陪伴对话 1~3 轮即可收尾；带工具（记忆/技能/通道发送）的回合
+     * 6~8 轮足够；10 轮留出余量，同时远小于旧值 64，避免「为凑数继续输出」。
+     * 气泡**条数**仍不受此值限制（每条气泡由 `emit_bubble`/`emit_segmented` 产出，
+     * 其护栏仍是 [com.yunian.ai.network.bubble.BubbleLoopRunner.MAX_BUBBLES]）。
+     */
+    const val AGENT_MAX_TOOL_ROUNDS = 10
+
     const val GROUP_CHAT_BUBBLE_GAP_MS = 500L
 
     const val GROUP_CHAT_CONTEXT_WINDOW = 20

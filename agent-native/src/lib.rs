@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod agentlog;
+pub mod api_penalty;
 pub mod api_probe;
 pub mod card_import;
 pub mod cordis_bridge;
@@ -32,6 +33,8 @@ pub(crate) mod retry;
 pub mod segmenter;
 pub mod skill_selector;
 pub mod sticker_preference;
+pub(crate) mod temperature;
+pub(crate) mod thinking;
 
 pub use agent::*;
 pub use api_probe::*;
