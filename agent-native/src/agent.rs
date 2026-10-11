@@ -1550,8 +1550,12 @@ impl AgentRuntime {
 
             // 正常文本 → 产出 bubble 事件，结束。通道发送已成功时，发布前做事实一致性校验：
             // 模型可以自然表达，但不能把刚完成的副作用反说成失败。
-            let content = reconcile_channel_send_statement(content, channel_send_succeeded);
-            // 唯一出口：最终正文同样剥思考块（模型把思考写在正文里时的主要泄漏点）
+            let raw_content = reconcile_channel_send_statement(content, channel_send_succeeded);
+            // 思考剥离后的正文才是本回合的「可见文本」——final_text、空回复判断、气泡出口
+            // 三处必须用**同一个值**。此前只在 push_bubble 内部剥离、外层继续用原文，导致
+            // 「整段都是 <thinking>」时：气泡为空 + content 非空 → 跳过空回复判断 →
+            // 以 completed 结束并把思考原文带进 final_text（通道侧会直接展示它）。
+            let content = crate::thinking::strip_thinking_blocks(&raw_content);
             push_bubble(&mut events, &content);
             // ── 修1：finish_reason 合法性判断 ──
             // parse_openai_response 把模型/API 错误平铺为 finish_reason="error"（含 error 字段）：
@@ -1578,7 +1582,11 @@ impl AgentRuntime {
             if content.is_empty() {
                 let has_output = events.iter().any(|e| e.kind == "bubble" || e.kind == "sticker");
                 if !has_output {
-                    let msg = if finish_reason == "length" {
+                    // 原文非空但剥离后为空 = 本轮**只写了思考**：给模型一条可执行的纠正指令，
+                    // 而不是笼统的「空响应」（这类回复会稳定复现，提示必须指向真实原因）。
+                    let msg = if !raw_content.trim().is_empty() {
+                        "模型本轮只输出了思考内容、没有可见回复（思考不得作为回复内容）：请把正式回复写在思考之外，不要只输出思考过程".to_string()
+                    } else if finish_reason == "length" {
                         "模型输出被 max_tokens 截断且未产生任何可见内容（finish_reason=length）——思考型模型可能把预算耗在推理上，请提高该 API 的最大输出（max_tokens）后重试".to_string()
                     } else {
                         format!("模型返回空响应（finish_reason={finish_reason:?}）")
@@ -2178,6 +2186,76 @@ mod tests {
             .get("_agent_preserve_system")
             .and_then(|v| v.as_bool())
             == Some(true)));
+    }
+
+    /// Issue #2 症状 1 回归（**最终正文出口**）：整段回复只有思考块时，
+    /// 必须以「只有思考、没有可见回复」判 error 结束，且 `final_text` 不得带思考原文
+    /// ——通道侧直接展示 `final_text`，这里若放行就等于没修。
+    #[test]
+    fn thinking_only_final_text_is_error_and_never_leaks_to_final_text() {
+        let (runner, gw, _transport) = mock_gateway(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":"<thinking>嗯，等待用户回答</thinking>"},"finish_reason":"stop"}]}"#,
+        ]);
+        let req = AgentTurnRequest {
+            group_id: None,
+            history_json: r#"[]"#.to_string(),
+            tools: vec![],
+            max_rounds: 3,
+            tool_choice: String::new(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        };
+        let result = runner.run_turn_inner(&req, Some(1), &gw, None, &NoopHost, &DefaultTurnStateMachine);
+        assert_eq!(
+            result.finished_reason, "error",
+            "纯思考回复不得以 completed 结束: {result:?}"
+        );
+        assert!(
+            result.final_text.is_empty(),
+            "final_text 不得携带思考原文: {}",
+            result.final_text
+        );
+        assert!(
+            result.events.iter().all(|e| e.kind != "bubble"),
+            "纯思考不得产出气泡: {:?}",
+            result.events
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("只输出了思考内容"),
+            "错误文案必须指向真实原因（只输出思考）: {err}"
+        );
+    }
+
+    /// 对照：正文含思考块但仍有可见回复时 → 正常 completed，且 final_text 只有可见部分。
+    #[test]
+    fn final_text_is_sanitized_when_reply_has_visible_part() {
+        let (runner, gw, _transport) = mock_gateway(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":"<thinking>先想想</thinking>今晚吃火锅吗？"},"finish_reason":"stop"}]}"#,
+        ]);
+        let req = AgentTurnRequest {
+            group_id: None,
+            history_json: r#"[]"#.to_string(),
+            tools: vec![],
+            max_rounds: 3,
+            tool_choice: String::new(),
+            sticker_probability: 0,
+            image: None,
+            system_prompt: None,
+            companion_name_map_json: None,
+        };
+        let result = runner.run_turn_inner(&req, Some(1), &gw, None, &NoopHost, &DefaultTurnStateMachine);
+        assert_eq!(result.finished_reason, "completed", "{result:?}");
+        assert_eq!(result.final_text, "今晚吃火锅吗？");
+        let bubbles: Vec<&str> = result
+            .events
+            .iter()
+            .filter(|e| e.kind == "bubble")
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(bubbles, vec!["今晚吃火锅吗？"]);
     }
 
     /// 空表情库（可用标签为空）且预选失败 → **绝不产出 sticker 事件**。

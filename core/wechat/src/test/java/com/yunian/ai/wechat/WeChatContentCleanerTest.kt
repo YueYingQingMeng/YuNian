@@ -21,6 +21,32 @@ class WeChatContentCleanerTest {
         assertEquals("你好呀。", cleaned)
     }
 
+    // ── stripThinking：只剥思考，**不动换行**（AI 自动回复要先按换行拆气泡） ──
+
+    @Test
+    fun stripThinking_removesClosedBlock_andKeepsNewlines() {
+        val raw = "<thinking>先分析用户意图</thinking>\n第一句\n第二句"
+        assertEquals("第一句\n第二句", WeChatContentCleaner.stripThinking(raw))
+    }
+
+    @Test
+    fun stripThinking_removesUnclosedBlock() {
+        val raw = "在的呀\n<thinking>嗯，等待用户回答"
+        assertEquals("在的呀", WeChatContentCleaner.stripThinking(raw))
+    }
+
+    @Test
+    fun stripThinking_doesNotTouchOtherCleaning() {
+        // 与 clean() 的区别：角色前缀 / 表情标签 / 标点都不动
+        val raw = "[角色1] 你好呀[开心]"
+        assertEquals(raw, WeChatContentCleaner.stripThinking(raw))
+    }
+
+    @Test
+    fun stripThinking_pureThinkingBecomesEmpty() {
+        assertEquals("", WeChatContentCleaner.stripThinking("<thinking>嗯，等待用户回答</thinking>"))
+    }
+
     @Test
     fun clean_stripsUnclosedThink() {
         val raw = "你好<think>未闭合思考一直到结尾"

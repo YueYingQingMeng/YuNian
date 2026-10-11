@@ -25,6 +25,7 @@ import com.yunian.ai.feature.wechat.data.model.M1Type
 import com.yunian.ai.feature.wechat.data.model.M2
 import com.yunian.ai.feature.wechat.service.WeChatOutboundDropLog
 import com.yunian.ai.feature.wechat.service.WeChatServiceLocator
+import com.yunian.ai.wechat.map.WeChatContentCleaner
 import com.yunian.ai.wechat.map.WeChatOutboundText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -300,7 +301,10 @@ class WeChatChatBridge(
         projection: WeChatTurnProjection,
     ): DialogueDelivery {
         // 唯一文本来源：turn 非空时 = events 连接，否则 = replyText（逐字未变的回退）。
-        val aiResponseText = projection.sourceText
+        // ⚠️ 这条路径**不经过** WeChatContentCleaner.clean()（那是主动发送/端口的管线），
+        // 因此思考块必须在这里先剥掉——否则事件文本里的 <thinking>… 会被当正文发到微信
+        // （Issue #2 症状 1 的通道泄漏面）。只剥思考、不动换行，气泡拆分语义不变。
+        val aiResponseText = WeChatContentCleaner.stripThinking(projection.sourceText)
         val aiMessageId = result.assistantMessageId ?: 0L
 
         if (aiMessageId > 0 && aiResponseText.isNotBlank()) {

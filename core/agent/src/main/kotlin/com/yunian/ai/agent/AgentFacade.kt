@@ -451,22 +451,23 @@ object AgentFacade {
 
     /**
      * 幂等种子：把内置聊天工具协议 skill 写入混合存储（Room 索引 + content.md）。
-     * 已存在（version ≥ [BUILTIN_CHAT_TOOL_SKILL_VERSION]）则跳过；应用启动时调用一次。
-     * 返回是否已就绪（已存在当前版本也视为成功；false 仅表示写入失败）。
+     * 已种入当前内容版本（见 [BUILTIN_CHAT_TOOL_SKILL_VERSION_KEY]）则跳过；应用启动时调用一次。
+     * 返回是否已就绪（已是当前版本也视为成功；false 仅表示写入失败）。
      */
     fun seedBuiltinChatToolSkill(context: Context): Boolean {
         val store = SkillStoreImpl(context)
-        // 先查索引：已存在且版本足够则跳过（不覆盖用户可能的自定义）
-        val listJson = store.listSkills(null)
-        val exists = runCatching {
-            val arr = org.json.JSONArray(listJson)
-            (0 until arr.length()).any { i ->
-                val o = arr.getJSONObject(i)
-                o.optString("skill_id") == BUILTIN_CHAT_TOOL_SKILL_ID &&
-                    o.optInt("version", 0) >= BUILTIN_CHAT_TOOL_SKILL_VERSION
-            }
-        }.getOrDefault(false)
-        if (exists) return true
+        val metaStore = com.yunian.ai.database.repository.AppMetaStore(
+            com.yunian.ai.database.AppDatabase.getDatabase(context).appMetaDao(),
+        )
+        // 版本比对必须用**内容版本**，不能用技能索引里的 `version`：
+        // `SkillStoreImpl.saveSkill` 写的是自增的**存储版本**（existing.version + 1），
+        // 两者不是一个空间。旧写法把自增计数当内容版本比 → 计数一旦越过常量（历史上多次
+        // 种入即可发生），内置技能就**永久停止更新**，协议新增的红线再也送不到这些用户。
+        val seededVersion = runCatching {
+            kotlinx.coroutines.runBlocking { metaStore.getString(BUILTIN_CHAT_TOOL_SKILL_VERSION_KEY) }
+                ?.trim()?.toIntOrNull()
+        }.getOrNull() ?: 0
+        if (seededVersion >= BUILTIN_CHAT_TOOL_SKILL_VERSION) return true
         val meta = org.json.JSONObject().apply {
             put("skill_id", BUILTIN_CHAT_TOOL_SKILL_ID)
             put("name", "微信真人聊天规范")
@@ -488,6 +489,14 @@ object AgentFacade {
         }
         val ok = store.saveSkill(meta.toString(), BUILTIN_CHAT_TOOL_SKILL_CONTENT)
         if (ok > 0) {
+            // 内容写成功后立刻记内容版本：用户此后对正文的自定义不会被下次启动覆盖
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    metaStore.putString(BUILTIN_CHAT_TOOL_SKILL_VERSION_KEY, BUILTIN_CHAT_TOOL_SKILL_VERSION.toString())
+                }
+            }.onFailure {
+                android.util.Log.w(TAG, "record builtin skill version failed: ${it.message}")
+            }
             android.util.Log.i(TAG, "seeded builtin chat-tool skill v$BUILTIN_CHAT_TOOL_SKILL_VERSION")
         } else {
             android.util.Log.w(TAG, "seed builtin chat-tool skill failed: $ok")
@@ -496,6 +505,9 @@ object AgentFacade {
     }
 
     private const val BUILTIN_CHAT_TOOL_SKILL_VERSION = 8
+
+    /** AppMetaStore KV 键：已种入的内置聊天技能**内容版本**（与技能索引的自增 version 无关）。 */
+    private const val BUILTIN_CHAT_TOOL_SKILL_VERSION_KEY = "builtin_chat_tool_skill_content_version"
 
     // ── Agent Memory（决策在 Rust：召回/评分/排序/整理；Kotlin 仅纯 IO） ──
 

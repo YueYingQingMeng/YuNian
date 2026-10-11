@@ -32,6 +32,43 @@ const THINK_TAGS: &str =
 /// 围栏代码块语言别名（```thinking 等）。
 const THINK_FENCES: &str = r"(?:thinking|thought|reasoning|analysis|think)";
 
+/// 显式明文标签别名（与 Kotlin `ResponsePostProcessor` 的同名形态一致）。
+const THINK_LABELS: &str = r"(?:思考|思维|推理|分析|thought|thinking)";
+
+fn closed_plaintext_bracket_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // 【思考】…【/思考】
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?is)【{THINK_LABELS}】[\s\S]*?【/{THINK_LABELS}】"))
+            .expect("closed plaintext bracket regex")
+    })
+}
+
+fn unclosed_plaintext_bracket_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // 【思考】…（到结尾）
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?is)【{THINK_LABELS}】[\s\S]*$")).expect("unclosed plaintext bracket regex")
+    })
+}
+
+fn closed_ascii_bracket_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // [思考]…[/思考]
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?is)\[{THINK_LABELS}\]\s*[\s\S]*?\[/{THINK_LABELS}\]"))
+            .expect("closed ascii bracket regex")
+    })
+}
+
+fn unclosed_ascii_bracket_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?is)\[{THINK_LABELS}\]\s*[\s\S]*$")).expect("unclosed ascii bracket regex")
+    })
+}
+
+
 fn closed_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -65,15 +102,20 @@ fn unclosed_fence_re() -> &'static Regex {
 
 /// 剥离文本中的思考块，返回可展示正文（首尾空白已裁剪）。
 ///
-/// 先剥闭合形态，再剥未闭合形态（未闭合的会吃掉至结尾，因此必须放在最后）。
+/// 顺序有讲究：先剥闭合形态，再剥未闭合形态（未闭合的会吃掉至结尾，必须放在最后）。
 pub(crate) fn strip_thinking_blocks(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
     let mut out = closed_tag_re().replace_all(text, "").into_owned();
     out = closed_fence_re().replace_all(&out, "").into_owned();
+    out = closed_plaintext_bracket_re().replace_all(&out, "").into_owned();
+    out = closed_ascii_bracket_re().replace_all(&out, "").into_owned();
+    // 未闭合形态放最后：它们会把「从这里到结尾」整段吃掉
     out = unclosed_tag_re().replace_all(&out, "").into_owned();
     out = unclosed_fence_re().replace_all(&out, "").into_owned();
+    out = unclosed_plaintext_bracket_re().replace_all(&out, "").into_owned();
+    out = unclosed_ascii_bracket_re().replace_all(&out, "").into_owned();
     out.trim().to_string()
 }
 
@@ -111,6 +153,26 @@ mod tests {
     fn strips_fenced_thinking_block() {
         let raw = "```thinking\n先想想怎么回\n```\n好呀，我在";
         assert_eq!(strip_thinking_blocks(raw), "好呀，我在");
+    }
+
+    /// 显式明文标签（与 Kotlin ResponsePostProcessor 覆盖的形态对齐）
+    #[test]
+    fn strips_explicit_plaintext_labels() {
+        assert_eq!(strip_thinking_blocks("【思考】她在问天气【/思考】今天多云"), "今天多云");
+        assert_eq!(strip_thinking_blocks("[思考]先分析一下[/思考]好呀"), "好呀");
+        assert_eq!(strip_thinking_blocks("【推理】先想【/推理】在的"), "在的");
+        // 未闭合形态：到结尾整段吃掉
+        assert_eq!(strip_thinking_blocks("在的呀\n【思考】嗯，等她回复"), "在的呀");
+        assert_eq!(strip_thinking_blocks("在的呀\n[思考]嗯，等她想清楚"), "在的呀");
+    }
+
+    /// 边界：**没有标签的自由明文思考**（如「嗯，等待用户回答」）剥不掉——
+    /// 这不是本模块的缺陷，而是刻意为之：启发式判 CoT 会误删正常回复。
+    /// 该形态由「模型侧协议禁令 + Kotlin 展示层启发式」兜底，见 agent.rs / ApiReasoning 说明。
+    #[test]
+    fn free_form_meta_narration_is_left_untouched_by_design() {
+        let raw = "嗯，等待用户回答";
+        assert_eq!(strip_thinking_blocks(raw), raw);
     }
 
     #[test]

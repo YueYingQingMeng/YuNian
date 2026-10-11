@@ -711,6 +711,12 @@ impl NativeGateway {
             "model": cfg.model,
             "system": system_text,
             "messages": anthro_messages,
+            // Anthropic Messages API 的 `max_tokens` 是**必填**字段，不能像 OpenAI 兼容路径
+            // 那样「未配置就不发」（省略会直接 400）。未配置时沿用既有默认 800——与 Kotlin
+            // `callAnthropic`（`config.maxTokens ?: 800`）逐字一致，不在此处擅自抬高（会改变
+            // 输出长度与费用）。注意：本分支的 Anthropic 请求体**不启用** extended thinking，
+            // 因此不存在「思考过程吃光 800 预算」的情形；将来若开启 thinking，必须同时把
+            // max_tokens 抬到 budget_tokens 之上（见 reasoning effort 相关实现）。
             "max_tokens": cfg.max_tokens.unwrap_or(800),
             // 同 OpenAI 兼容路径：temperature 必须 2 位小数（见 temperature.rs）
             "temperature": crate::temperature::normalize_temperature(cfg.temperature),
